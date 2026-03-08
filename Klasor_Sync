@@ -1,0 +1,416 @@
+import sys
+import os
+import subprocess
+import tempfile
+import csv
+from datetime import datetime
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QPushButton, QLabel, QTreeWidget, QTreeWidgetItem, QTextEdit,
+    QFrame, QHeaderView, QAbstractItemView, QFileDialog
+)
+from PyQt5.QtCore import QThread, pyqtSignal, Qt
+from PyQt5.QtGui import QFont, QColor, QBrush
+
+KAYNAK  = r"D:\PlayboxSIM\Oyunlar"
+HEDEF   = r"D:\PlayboxSIM\Steam\steamapps\common"
+FARKLAR = r"G:\OyunlarFark"
+
+
+class SyncWorker(QThread):
+    log_signal  = pyqtSignal(str)
+    done_signal = pyqtSignal(bool, str)
+
+    def __init__(self, secilen_klasorler):
+        super().__init__()
+        self.secilen = secilen_klasorler
+
+    def run(self):
+        for klasor in self.secilen:
+            kaynak_yol  = os.path.join(KAYNAK,  klasor)
+            hedef_yol   = os.path.join(HEDEF,   klasor)
+            farklar_yol = os.path.join(FARKLAR, klasor)
+
+            script = f"""
+$kaynak  = "{kaynak_yol}"
+$hedef   = "{hedef_yol}"
+$farklar = "{farklar_yol}"
+$dosyalar = Get-ChildItem -Path $kaynak -Recurse -ErrorAction SilentlyContinue
+if (-not $dosyalar) {{ Write-Host "Bos/bulunamadi: $kaynak"; exit 0 }}
+$sayac = 0
+foreach ($dosya in $dosyalar) {{
+    if (!$dosya.PSIsContainer) {{
+        $hedefYolu = $dosya.FullName.Replace($kaynak, $hedef)
+        $farkYolu  = $dosya.FullName.Replace($kaynak, $farklar)
+        if (!(Test-Path $hedefYolu) -or (Get-Item $hedefYolu).LastWriteTime -lt $dosya.LastWriteTime) {{
+            $yeniKlasor = Split-Path $farkYolu
+            if (!(Test-Path $yeniKlasor)) {{ New-Item -ItemType Directory -Path $yeniKlasor -Force | Out-Null }}
+            Copy-Item -Path $dosya.FullName -Destination $farkYolu -Force
+            Write-Host "KOPYALANDI|{klasor}|$($dosya.FullName)|$farkYolu|$($dosya.LastWriteTime)"
+            $sayac++
+        }}
+    }}
+}}
+Write-Host "TAMAMLANDI|{klasor}|$sayac"
+"""
+            try:
+                with tempfile.NamedTemporaryFile(suffix=".ps1", delete=False,
+                                                 mode="w", encoding="utf-8") as f:
+                    f.write(script)
+                    tmp = f.name
+
+                self.log_signal.emit(f"LOG|[{klasor}] işleniyor...")
+
+                proc = subprocess.Popen(
+                    ["powershell", "-ExecutionPolicy", "Bypass",
+                     "-WindowStyle", "Hidden",          # ← pencere gizli
+                     "-NonInteractive",
+                     "-File", tmp],
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, encoding="utf-8", errors="replace",
+                    creationflags=subprocess.CREATE_NO_WINDOW  # ← konsol penceresi yok
+                )
+                for line in proc.stdout:
+                    line = line.rstrip()
+                    if line:
+                        self.log_signal.emit(line)
+                proc.wait()
+                os.unlink(tmp)
+            except Exception as e:
+                self.log_signal.emit(f"LOG|HATA: {e}")
+
+        self.done_signal.emit(True, f"{len(self.secilen)} klasör işlendi.")
+
+
+class PathRow(QWidget):
+    def __init__(self, tag, path, parent=None):
+        super().__init__(parent)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(6)
+
+        lbl_tag = QLabel(f"{tag}:")
+        lbl_tag.setFont(QFont("Segoe UI", 9, QFont.Bold))
+        lbl_tag.setFixedWidth(58)
+        lbl_tag.setStyleSheet("color: #555;")
+
+        lbl_val = QLabel(path)
+        lbl_val.setFont(QFont("Segoe UI", 9))
+        lbl_val.setStyleSheet("color: #222;")
+
+        btn = QPushButton("📁")
+        btn.setFixedSize(24, 24)
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.setToolTip(f"Klasörü aç: {path}")
+        btn.setStyleSheet("""
+            QPushButton { border: none; background: transparent; font-size: 14px; }
+            QPushButton:hover { background: #dde4f5; border-radius: 3px; }
+        """)
+        btn.clicked.connect(lambda: self._open(path))
+
+        layout.addWidget(lbl_tag)
+        layout.addWidget(lbl_val, 1)
+        layout.addWidget(btn)
+
+    def _open(self, path):
+        if not os.path.isdir(path):
+            os.makedirs(path, exist_ok=True)
+        os.startfile(path)
+
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Klasör Senkronizasyonu")
+        self.setMinimumSize(680, 640)
+        self.resize(720, 680)
+        self.setStyleSheet("background: #f5f5f5;")
+        self.log_entries = []   # CSV için ham kayıtlar
+        self._build_ui()
+        self._load_folders()
+
+    def _build_ui(self):
+        central = QWidget()
+        self.setCentralWidget(central)
+        layout = QVBoxLayout(central)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(10)
+
+        fb = QFont("Segoe UI", 9, QFont.Bold)
+        fl = QFont("Segoe UI", 9)
+
+        # ── Yol bilgileri ────────────────────────────────────────────────
+        info = QFrame()
+        info.setStyleSheet("""
+            QFrame { background: #eef2fb; border: 1px solid #ccd6f0; border-radius: 5px; }
+        """)
+        il = QVBoxLayout(info)
+        il.setContentsMargins(12, 10, 12, 10)
+        il.setSpacing(4)
+        for tag, val in [("Kaynak", KAYNAK), ("Hedef", HEDEF), ("Farklar", FARKLAR)]:
+            il.addWidget(PathRow(tag, val))
+        layout.addWidget(info)
+
+        # ── Başlık + butonlar ────────────────────────────────────────────
+        row_top = QHBoxLayout()
+        lbl = QLabel("Oyun Listesi")
+        lbl.setFont(fb)
+        lbl.setStyleSheet("color: #333;")
+        row_top.addWidget(lbl)
+        row_top.addStretch()
+        for text, slot in [("Tümünü Seç", self._select_all),
+                            ("Seçimi Kaldır", self._select_none),
+                            ("🔄 Yenile", self._load_folders)]:
+            b = QPushButton(text)
+            b.setFont(fl)
+            b.setFixedHeight(26)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setStyleSheet("""
+                QPushButton { border: 1px solid #ccc; border-radius: 3px;
+                    background: white; color: #444; padding: 0 10px; }
+                QPushButton:hover { background: #eee; }
+            """)
+            b.clicked.connect(slot)
+            row_top.addWidget(b)
+        layout.addLayout(row_top)
+
+        # ── Renk açıklaması ──────────────────────────────────────────────
+        legend = QHBoxLayout()
+        legend.setSpacing(16)
+        for color, text in [("#27ae60", "Güncel"),
+                             ("#e67e22", "Eksik / Güncel değil"),
+                             ("#c0392b", "Hedefte yok")]:
+            dot = QLabel("●")
+            dot.setStyleSheet(f"color: {color}; font-size: 12px;")
+            lbl2 = QLabel(text)
+            lbl2.setFont(QFont("Segoe UI", 8))
+            lbl2.setStyleSheet("color: #666;")
+            legend.addWidget(dot)
+            legend.addWidget(lbl2)
+        legend.addStretch()
+        layout.addLayout(legend)
+
+        # ── Tree ─────────────────────────────────────────────────────────
+        self.tree = QTreeWidget()
+        self.tree.setColumnCount(2)
+        self.tree.setHeaderLabels(["Oyun Adı", "Durum"])
+        self.tree.setSelectionMode(QAbstractItemView.MultiSelection)
+        self.tree.setRootIsDecorated(False)
+        self.tree.setAlternatingRowColors(True)
+        self.tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
+        self.tree.header().setSectionResizeMode(1, QHeaderView.Fixed)
+        self.tree.header().resizeSection(1, 160)
+        self.tree.setFont(QFont("Segoe UI", 10))
+        self.tree.setStyleSheet("""
+            QTreeWidget { border: 1px solid #ccc; border-radius: 4px;
+                background: white; alternate-background-color: #f9f9f9; }
+            QTreeWidget::item { padding: 5px 8px; }
+            QTreeWidget::item:selected { background: #2d6cdf; color: white; }
+            QHeaderView::section { background: #e8edf5; border: none;
+                border-bottom: 1px solid #ccd; border-right: 1px solid #ccd;
+                padding: 5px 10px; font-weight: bold; color: #444; }
+        """)
+        layout.addWidget(self.tree)
+
+        # ── Alt butonlar ─────────────────────────────────────────────────
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+
+        self.run_btn = QPushButton("▶  Senkronize Et")
+        self.run_btn.setMinimumHeight(36)
+        self.run_btn.setFont(QFont("Segoe UI", 10, QFont.Bold))
+        self.run_btn.setCursor(Qt.PointingHandCursor)
+        self.run_btn.setStyleSheet("""
+            QPushButton { background: #2d6cdf; color: white; border: none; border-radius: 4px; }
+            QPushButton:hover { background: #1e5ac7; }
+            QPushButton:pressed { background: #174aab; }
+            QPushButton:disabled { background: #a0b8e8; }
+        """)
+        self.run_btn.clicked.connect(self._run_sync)
+
+        self.csv_btn = QPushButton("💾  CSV Kaydet")
+        self.csv_btn.setMinimumHeight(36)
+        self.csv_btn.setFont(QFont("Segoe UI", 10, QFont.Bold))
+        self.csv_btn.setCursor(Qt.PointingHandCursor)
+        self.csv_btn.setEnabled(False)
+        self.csv_btn.setStyleSheet("""
+            QPushButton { background: #27ae60; color: white; border: none; border-radius: 4px; }
+            QPushButton:hover { background: #1e8449; }
+            QPushButton:pressed { background: #196f3d; }
+            QPushButton:disabled { background: #a9dfbf; }
+        """)
+        self.csv_btn.clicked.connect(self._export_csv)
+
+        btn_row.addWidget(self.run_btn, 3)
+        btn_row.addWidget(self.csv_btn, 1)
+        layout.addLayout(btn_row)
+
+        # ── Log ──────────────────────────────────────────────────────────
+        log_header = QHBoxLayout()
+        lbl_log = QLabel("Çıktı")
+        lbl_log.setFont(fb)
+        lbl_log.setStyleSheet("color: #555;")
+        log_header.addWidget(lbl_log)
+        log_header.addStretch()
+        clr_btn = QPushButton("Temizle")
+        clr_btn.setFont(fl)
+        clr_btn.setFixedHeight(22)
+        clr_btn.setCursor(Qt.PointingHandCursor)
+        clr_btn.setStyleSheet("""
+            QPushButton { border: 1px solid #ccc; border-radius: 3px;
+                background: white; color: #888; padding: 0 8px; }
+            QPushButton:hover { background: #eee; }
+        """)
+        clr_btn.clicked.connect(self._clear_log)
+        log_header.addWidget(clr_btn)
+        layout.addLayout(log_header)
+
+        self.log = QTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setMaximumHeight(130)
+        self.log.setFont(QFont("Consolas", 9))
+        self.log.setStyleSheet("""
+            QTextEdit { border: 1px solid #ccc; border-radius: 4px;
+                background: white; color: #333; padding: 6px; }
+        """)
+        layout.addWidget(self.log)
+
+        self.status = QLabel("Hazır")
+        self.status.setFont(QFont("Segoe UI", 8))
+        self.status.setStyleSheet("color: #888;")
+        layout.addWidget(self.status)
+
+    # ── Klasör yükleme ────────────────────────────────────────────────────
+    def _karsilastir(self, klasor_adi):
+        kaynak_path = os.path.join(KAYNAK, klasor_adi)
+        hedef_path  = os.path.join(HEDEF,  klasor_adi)
+        if not os.path.isdir(hedef_path):
+            return "hedefte_yok"
+        try:
+            for root, _, files in os.walk(kaynak_path):
+                for f in files:
+                    src = os.path.join(root, f)
+                    rel = os.path.relpath(src, kaynak_path)
+                    dst = os.path.join(hedef_path, rel)
+                    if not os.path.exists(dst) or os.path.getmtime(src) > os.path.getmtime(dst):
+                        return "eksik"
+            return "guncel"
+        except:
+            return "eksik"
+
+    def _load_folders(self):
+        self.tree.clear()
+        if not os.path.isdir(KAYNAK):
+            self.status.setText(f"Kaynak bulunamadı: {KAYNAK}")
+            return
+        try:
+            klasorler = sorted(d for d in os.listdir(KAYNAK)
+                               if os.path.isdir(os.path.join(KAYNAK, d)))
+        except Exception as e:
+            self.status.setText(f"Hata: {e}")
+            return
+
+        for k in klasorler:
+            durum_key = self._karsilastir(k)
+            if durum_key == "guncel":
+                durum_text, fg, bg = "Güncel", QColor("#27ae60"), None
+            elif durum_key == "eksik":
+                durum_text, fg, bg = "Eksik / Güncel değil", QColor("#e67e22"), QColor("#fef5e7")
+            else:
+                durum_text, fg, bg = "Hedefte yok", QColor("#c0392b"), QColor("#fdecea")
+
+            item = QTreeWidgetItem([k, durum_text])
+            item.setForeground(0, QBrush(fg))
+            item.setForeground(1, QBrush(fg))
+            if bg:
+                item.setBackground(0, QBrush(bg))
+                item.setBackground(1, QBrush(bg))
+            self.tree.addTopLevelItem(item)
+
+        self.status.setText(f"{len(klasorler)} klasör listelendi.")
+
+    def _select_all(self):   self.tree.selectAll()
+    def _select_none(self):  self.tree.clearSelection()
+    def _clear_log(self):    self.log.clear()
+
+    # ── Senkronizasyon ────────────────────────────────────────────────────
+    def _run_sync(self):
+        secilen = [self.tree.topLevelItem(i).text(0)
+                   for i in range(self.tree.topLevelItemCount())
+                   if self.tree.topLevelItem(i).isSelected()]
+        if not secilen:
+            self.log.append("Lütfen en az bir klasör seçin.")
+            return
+
+        self.log_entries.clear()
+        self.csv_btn.setEnabled(False)
+        self.run_btn.setEnabled(False)
+        self.log.clear()
+        self.log.append(f"{len(secilen)} klasör senkronize ediliyor...")
+        self.status.setText("Çalışıyor...")
+
+        self.worker = SyncWorker(secilen)
+        self.worker.log_signal.connect(self._handle_log)
+        self.worker.done_signal.connect(self._on_done)
+        self.worker.start()
+
+    def _handle_log(self, line):
+        # Satır ayrıştırma: KOPYALANDI|oyun|kaynak|hedef|tarih
+        if line.startswith("KOPYALANDI|"):
+            parts = line.split("|")
+            if len(parts) >= 5:
+                oyun, kaynak, hedef, tarih = parts[1], parts[2], parts[3], parts[4]
+                dosya_adi = os.path.basename(kaynak)
+                self.log_entries.append({
+                    "Zaman":     datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "Oyun":      oyun,
+                    "Dosya":     dosya_adi,
+                    "Kaynak":    kaynak,
+                    "Hedef":     hedef,
+                    "Tarih":     tarih,
+                })
+                self.log.append(f"  ✔ [{oyun}] {dosya_adi}")
+        elif line.startswith("TAMAMLANDI|"):
+            parts = line.split("|")
+            if len(parts) >= 3:
+                self.log.append(f"  → {parts[1]}: {parts[2]} dosya kopyalandı.")
+        elif line.startswith("LOG|"):
+            self.log.append(line[4:])
+        else:
+            self.log.append(line)
+
+    def _on_done(self, success, msg):
+        self.log.append(f"\n✔ {msg}")
+        self.status.setText(msg)
+        self.run_btn.setEnabled(True)
+        if self.log_entries:
+            self.csv_btn.setEnabled(True)
+        self._load_folders()
+
+    # ── CSV Export ────────────────────────────────────────────────────────
+    def _export_csv(self):
+        if not self.log_entries:
+            self.log.append("Kaydedilecek veri yok.")
+            return
+        default_name = f"sync_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "CSV Kaydet", default_name, "CSV Dosyası (*.csv)"
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.DictWriter(f, fieldnames=["Zaman","Oyun","Dosya","Kaynak","Hedef","Tarih"])
+                writer.writeheader()
+                writer.writerows(self.log_entries)
+            self.log.append(f"✔ CSV kaydedildi: {path}")
+            self.status.setText(f"CSV kaydedildi: {os.path.basename(path)}")
+        except Exception as e:
+            self.log.append(f"CSV hatası: {e}")
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    win = MainWindow()
+    win.show()
+    sys.exit(app.exec_())
